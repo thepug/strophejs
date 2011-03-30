@@ -351,7 +351,23 @@ Strophe = {
 
         return doc;
     },
-
+    /** Function: textToXml
+     *  Convert text data to Dom parsed element.
+     */
+    textToXml: function(text) {
+        var xmlDoc = null;
+        if (window.DOMParser) {
+            var parser=new DOMParser();
+            xmlDoc=parser.parseFromString(text,"text/xml");
+        } 
+        else // Internet Explorer 
+        {
+            xmlDoc=new ActiveXObject("Microsoft.XMLDOM");
+            xmlDoc.async="false";
+            xmlDoc.loadXML(text); 
+        }
+        return xmlDoc.documentElement;
+    },
     /** Function: xmlGenerator
      *  Get the DOM document to generate elements.
      *
@@ -1116,7 +1132,8 @@ Strophe.Handler.prototype = {
 
             nsMatch = nsMatch || elem.getAttribute("xmlns") == this.ns;
         }
-
+        console.log(this.name);
+        console.log("matching elem:"); console.log(elem);
         if (nsMatch &&
             (!this.name || Strophe.isTagEqual(elem, this.name)) &&
             (!this.type || elem.getAttribute("type") == this.type) &&
@@ -1416,6 +1433,7 @@ Strophe.Connection = function (service)
     this._disconnectTimeout = null;
 
     this.authenticated = false;
+    this.authenticating = false;
     this.disconnecting = false;
     this.connected = false;
 
@@ -1427,6 +1445,9 @@ Strophe.Connection = function (service)
     this.hold = 1;
     this.wait = 60;
     this.window = 5;
+
+    // indicate if websocket connection
+    this._websocket = false;
 
     this._data = [];
     this._requests = [];
@@ -1477,7 +1498,7 @@ Strophe.Connection.prototype = {
         this.removeHandlers = [];
         this.addTimeds = [];
         this.addHandlers = [];
-
+        this.authenticating = false;
         this.authenticated = false;
         this.disconnecting = false;
         this.connected = false;
@@ -1585,27 +1606,66 @@ Strophe.Connection.prototype = {
 
         // parse jid for domain and resource
         this.domain = Strophe.getDomainFromJid(this.jid);
-
-        // build the body tag
-        var body = this._buildBody().attrs({
-            to: this.domain,
-            "xml:lang": "en",
-            wait: this.wait,
-            hold: this.hold,
-            content: "text/xml; charset=utf-8",
-            ver: "1.6",
-            "xmpp:version": "1.0",
-            "xmlns:xmpp": Strophe.NS.BOSH
-        });
-
         this._changeConnectStatus(Strophe.Status.CONNECTING, null);
+        var ws_regex = /^wss?:\/\//;
+        if (ws_regex.test(this.service) && window.WebSocket) 
+        {
+            var to = this.domain;
+            if (!to) {
+                to = this.jid;
+            }
+            var _myconn = this;
+            //websocket
+            this._websocket = new WebSocket(this.service, "xmpp");
+            //set handlers
+            this._websocket.onerror = function(e) {
+                Strophe.fatal("error: " + e);
+            };
+            this._websocket.onopen = function() {
+                //send stream start tag
+                var streamstart = $build('stream:stream',
+                                         {'xmlns:stream':Strophe.NS.STREAM,
+                                          xmlns:Strophe.NS.CLIENT,
+                                          to:to,
+                                          version:'1.0'
+                                         });
+                this.send(streamstart);
+            };
+            this._websocket.onclose = function() {
+                _myconn._doDisconnect();
+            };
+            this._websocket.onmessage = function(e) {
+                if (_myconn.authenticating || _myconn.authenticated) {
+                    console.log("dataRecv");
+                    _myconn._dataRecv(e);
+                } else {
+                    console.log("connect_cb");
+                    _myconn._connect_cb(e);
+                }
+            }
+        }
+        else
+        {
+            // build the body tag
+            var body = this._buildBody().attrs({
+                to: this.domain,
+                "xml:lang": "en",
+                wait: this.wait,
+                hold: this.hold,
+                content: "text/xml; charset=utf-8",
+                ver: "1.6",
+                "xmpp:version": "1.0",
+                "xmlns:xmpp": Strophe.NS.BOSH
+            });
 
-        this._requests.push(
-            new Strophe.Request(body.tree(),
-                                this._onRequestStateChange.bind(
-                                    this, this._connect_cb.bind(this)),
-                                body.tree().getAttribute("rid")));
-        this._throttledRequestHandler();
+            
+            this._requests.push(
+                new Strophe.Request(body.tree(),
+                                    this._onRequestStateChange.bind(
+                                        this, this._connect_cb.bind(this)),
+                                    body.tree().getAttribute("rid")));
+            this._throttledRequestHandler();
+        }
     },
 
     /** Function: attach
@@ -1734,21 +1794,25 @@ Strophe.Connection.prototype = {
     send: function (elem)
     {
         if (elem === null) { return ; }
-        if (typeof(elem.sort) === "function") {
-            for (var i = 0; i < elem.length; i++) {
-                this._queueData(elem[i]);
-            }
-        } else if (typeof(elem.tree) === "function") {
-            this._queueData(elem.tree());
+        if (this._websocket) {
+            this.xmlInput(elem);
+            this.rawInput(Strophe.serialize(elem));
+            this._websocket.send(Strophe.serialize(elem));
         } else {
-            this._queueData(elem);
-        }
-
-        this._throttledRequestHandler();
-        clearTimeout(this._idleTimeout);
-        this._idleTimeout = setTimeout(this._onIdle.bind(this), 100);
+            if (typeof(elem.sort) === "function") {
+                for (var i = 0; i < elem.length; i++) {
+                    this._queueData(elem[i]);
+                }
+            } else if (typeof(elem.tree) === "function") {
+                this._queueData(elem.tree());
+            } else {
+                this._queueData(elem);
+            }
+            this._throttledRequestHandler();
+            clearTimeout(this._idleTimeout);
+            this._idleTimeout = setTimeout(this._onIdle.bind(this), 100);
+        }        
     },
-
     /** Function: flush
      *  Immediately send any pending outgoing data.
      *
@@ -1996,7 +2060,7 @@ Strophe.Connection.prototype = {
             // setup timeout handler
             this._disconnectTimeout = this._addSysTimedHandler(
                 3000, this._onDisconnectTimeout.bind(this));
-            this._sendTerminate();
+            this._sendTerminate();            
         }
     },
 
@@ -2107,6 +2171,7 @@ Strophe.Connection.prototype = {
      */
     _processRequest: function (i)
     {
+        if (this._websocket) { return; }  
         var req = this._requests[i];
         var reqStatus = -1;
 
@@ -2360,6 +2425,7 @@ Strophe.Connection.prototype = {
     {
         Strophe.info("_doDisconnect was called");
         this.authenticated = false;
+        this.authenticating = false;
         this.disconnecting = false;
         this.sid = null;
         this.streamId = null;
@@ -2393,8 +2459,13 @@ Strophe.Connection.prototype = {
      */
     _dataRecv: function (req)
     {
+        var elem = null;
         try {
-            var elem = req.getResponse();
+            if (this._websocket) {
+                elem = Strophe.textToXml(req.data);
+            } else {
+                elem = req.getResponse();
+            }
         } catch (e) {
             if (e != "parsererror") { throw e; }
             this.disconnect("strophe-parsererror");
@@ -2449,16 +2520,24 @@ Strophe.Connection.prototype = {
             this.disconnect();
             return;
         }
-
+        var nelem = null;
+        if (this._websocket) {
+            //must add parent element for loop to work. dirty hack :(
+            nelem = Strophe.xmlElement("body");
+            nelem.appendChild(elem);
+        } else {
+            nelem = elem;
+        }
         // send each incoming stanza through the handler chain
         var that = this;
-        Strophe.forEachChild(elem, null, function (child) {
+        Strophe.forEachChild(nelem, null, function (child) {
             var i, newList;
             // process handlers
             newList = that.handlers;
             that.handlers = [];
             for (i = 0; i < newList.length; i++) {
                 var hand = newList[i];
+                 console.log("processing handlers");console.log(hand);
                 if (hand.isMatch(child) &&
                     (that.authenticated || !hand.user)) {
                     if (hand.run(child)) {
@@ -2491,14 +2570,18 @@ Strophe.Connection.prototype = {
         }
 
         this.disconnecting = true;
-
-        var req = new Strophe.Request(body.tree(),
-                                      this._onRequestStateChange.bind(
-                                          this, this._dataRecv.bind(this)),
-                                      body.tree().getAttribute("rid"));
-
-        this._requests.push(req);
-        this._throttledRequestHandler();
+        if (this._websocket) {
+            var terminate = $pres({type:'unavailable'});
+            this._websocket.send(terminate);
+        } else {
+            var req = new Strophe.Request(body.tree(),
+                                          this._onRequestStateChange.bind(
+                                              this, this._dataRecv.bind(this)),
+                                          body.tree().getAttribute("rid"));
+            
+            this._requests.push(req);
+            this._throttledRequestHandler();
+        }
     },
 
     /** PrivateFunction: _connect_cb
@@ -2519,7 +2602,13 @@ Strophe.Connection.prototype = {
         Strophe.info("_connect_cb was called");
 
         this.connected = true;
-        var bodyWrap = req.getResponse();
+        var bodyWrap = null
+        if (this._websocket)
+        {
+            bodyWrap = Strophe.textToXml(req.data);
+        } else {
+            bodyWrap = req.getResponse();
+        }
         if (!bodyWrap) { return; }
 
         this.xmlInput(bodyWrap);
@@ -2578,12 +2667,15 @@ Strophe.Connection.prototype = {
         } else {
             // we didn't get stream:features yet, so we need wait for it
             // by sending a blank poll request
-            var body = this._buildBody();
-            this._requests.push(
-                new Strophe.Request(body.tree(),
-                                    this._onRequestStateChange.bind(
-                                        this, this._connect_cb.bind(this)),
-                                    body.tree().getAttribute("rid")));
+            if (!this._websocket)
+            {
+                var body = this._buildBody();
+                this._requests.push(
+                    new Strophe.Request(body.tree(),
+                                        this._onRequestStateChange.bind(
+                                            this, this._connect_cb.bind(this)),
+                                        body.tree().getAttribute("rid")));
+            }
             this._throttledRequestHandler();
             return;
         }
@@ -2591,6 +2683,7 @@ Strophe.Connection.prototype = {
         if (Strophe.getNodeFromJid(this.jid) === null &&
             do_sasl_anonymous) {
             this._changeConnectStatus(Strophe.Status.AUTHENTICATING, null);
+            this.authenticating = true;
             this._sasl_success_handler = this._addSysHandler(
                 this._sasl_success_cb.bind(this), null,
                 "success", null, null);
@@ -2631,6 +2724,7 @@ Strophe.Connection.prototype = {
             auth_str = auth_str + this.pass;
 
             this._changeConnectStatus(Strophe.Status.AUTHENTICATING, null);
+            this.authenticating = true;
             this._sasl_success_handler = this._addSysHandler(
                 this._sasl_success_cb.bind(this), null,
                 "success", null, null);
@@ -2727,7 +2821,7 @@ Strophe.Connection.prototype = {
                           cnonce + ":auth:" +
                           MD5.hexdigest(A2))) + ',';
         responseText += 'charset="utf-8"';
-
+        this.authenticating = true;
         this._sasl_challenge_handler = this._addSysHandler(
             this._sasl_challenge2_cb.bind(this), null,
             "challenge", null, null);
@@ -2969,6 +3063,7 @@ Strophe.Connection.prototype = {
         } else if (elem.getAttribute("type") == "error") {
             Strophe.info("Session creation failed.");
             this._changeConnectStatus(Strophe.Status.AUTHFAIL, null);
+            this.authenticating = false;
             return false;
         }
 
@@ -2995,7 +3090,7 @@ Strophe.Connection.prototype = {
             this.deleteHandler(this._sasl_challenge_handler);
             this._sasl_challenge_handler = null;
         }
-
+        this.authenticating = false;
         this._changeConnectStatus(Strophe.Status.AUTHFAIL, null);
         return false;
     },
@@ -3169,12 +3264,17 @@ Strophe.Connection.prototype = {
             }
             delete this._data;
             this._data = [];
-            this._requests.push(
-                new Strophe.Request(body.tree(),
-                                    this._onRequestStateChange.bind(
-                                        this, this._dataRecv.bind(this)),
-                                    body.tree().getAttribute("rid")));
-            this._processRequest(this._requests.length - 1);
+            if (this._websocket) {
+                console.log("_onIdle send");
+                this._websocket.send(body);
+            } else {
+                this._requests.push(
+                    new Strophe.Request(body.tree(),
+                                        this._onRequestStateChange.bind(
+                                            this, this._dataRecv.bind(this)),
+                                        body.tree().getAttribute("rid")));
+                this._processRequest(this._requests.length - 1);
+            }
         }
 
         if (this._requests.length > 0) {
